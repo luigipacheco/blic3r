@@ -15,165 +15,6 @@ bl_info = {
     "category": "Mesh",
 }
 
-# --- Helper functions for robust cross-section generation ---
-
-def _plane_basis_from_normal(n: Vector):
-    """Create orthonormal basis for plane with given normal"""
-    n = n.normalized()
-    # pick a non-parallel vector
-    tmp = Vector((1,0,0)) if abs(n.x) < 0.9 else Vector((0,1,0))
-    u = (tmp.cross(n)).normalized()
-    v = n.cross(u).normalized()
-    return u, v, n
-
-def _project_to_plane2d(points, plane_co, plane_no):
-    """Project 3D points to 2D in the plane"""
-    u, v, _ = _plane_basis_from_normal(plane_no)
-    out = []
-    for p in points:
-        d = p - plane_co
-        out.append(Vector((d.dot(u), d.dot(v), 0.0)))
-    return out
-
-def _signed_area_2d(points2d):
-    """Calculate signed area of 2D polygon"""
-    a = 0.0
-    n = len(points2d)
-    for i in range(n):
-        x1, y1 = points2d[i].x, points2d[i].y
-        x2, y2 = points2d[(i+1)%n].x, points2d[(i+1)%n].y
-        a += x1*y2 - x2*y1
-    return 0.5 * a
-
-def _arc_length_resample(loop3d, target_n):
-    """Resample loop to exactly target_n points by arc length"""
-    # compute cumulative lengths
-    n = len(loop3d)
-    L = [0.0]
-    total = 0.0
-    for i in range(n):
-        p1 = loop3d[i]
-        p2 = loop3d[(i + 1) % n]
-        seg = (p2 - p1).length
-        total += seg
-        L.append(total)
-    if total < 1e-9:
-        return None
-    step = total / target_n
-    resampled = []
-    # walk along edges to place samples
-    edge_i = 0
-    p1 = loop3d[0]
-    p2 = loop3d[1]
-    seg_len = (p2 - p1).length
-    seg_accum = 0.0
-    target = 0.0
-    for k in range(target_n):
-        target = k * step
-        # advance to segment containing target
-        while L[edge_i+1] < target and edge_i < n-1:
-            edge_i += 1
-        # interpolate on edge edge_i
-        local_start = L[edge_i]
-        local_end = L[edge_i+1]
-        t = 0.0 if (local_end - local_start) < 1e-9 else (target - local_start) / (local_end - local_start)
-        a = loop3d[edge_i]
-        b = loop3d[(edge_i + 1) % n]
-        resampled.append(a.lerp(b, max(0.0, min(1.0, t))))
-    return resampled
-
-def _best_cyclic_alignment(A, B):
-    """Return (offset, reversed) so that B shifted (and maybe reversed) matches A best"""
-    n = len(A)
-    if n != len(B):
-        return 0, False
-    # precompute for speed
-    def err_for(offset, rev):
-        e = 0.0
-        if rev:
-            for i in range(n):
-                d = A[i] - B[(n - (i+offset)) % n]
-                e += d.length_squared
-        else:
-            for i in range(n):
-                d = A[i] - B[(i+offset) % n]
-                e += d.length_squared
-        return e
-    best = (0, False)
-    best_err = float('inf')
-    for off in range(n):
-        e0 = err_for(off, False)
-        if e0 < best_err:
-            best_err, best = e0, (off, False)
-        e1 = err_for(off, True)
-        if e1 < best_err:
-            best_err, best = e1, (off, True)
-    return best
-
-def _slice_loops_from_bisect(bm_src, plane_co: Vector, plane_no: Vector, eps=1e-5):
-    """Return list of loops; each loop is ordered list of Vector coords on plane."""
-    bm = bm_src.copy()
-    geom = list(bm.verts) + list(bm.edges) + list(bm.faces)
-    bmesh.ops.bisect_plane(
-        bm, geom=geom, plane_co=plane_co, plane_no=plane_no,
-        clear_outer=False, clear_inner=False, use_snap_center=False
-    )
-    bm.verts.ensure_lookup_table()
-    bm.edges.ensure_lookup_table()
-
-    # Collect edges whose both verts lie on the plane
-    def on_plane(v):
-        return abs((v.co - plane_co).dot(plane_no)) < eps
-
-    plane_edges = [e for e in bm.edges if on_plane(e.verts[0]) and on_plane(e.verts[1])]
-    if not plane_edges:
-        bm.free()
-        return []
-
-    # Build vertex adjacency on-plane
-    adj = {}
-    for e in plane_edges:
-        a, b = e.verts[0], e.verts[1]
-        adj.setdefault(a, []).append(b)
-        adj.setdefault(b, []).append(a)
-
-    # Walk loops
-    visited = set()
-    loops = []
-    for v_start in list(adj.keys()):
-        if v_start in visited:
-            continue
-        # ensure degree 2 for loop; if not, still try to walk
-        loop = []
-        v = v_start
-        prev = None
-        while True:
-            loop.append(v)
-            visited.add(v)
-            nbrs = adj.get(v, [])
-            nxt = None
-            # pick neighbor that isn't prev; prefer consistent traversal
-            if len(nbrs) == 1:
-                nxt = nbrs[0]
-            else:
-                for cand in nbrs:
-                    if cand != prev:
-                        nxt = cand
-                        break
-            if nxt is None:
-                break
-            prev, v = v, nxt
-            if v == v_start:
-                break
-        # only keep closed loops with length >= 3
-        if len(loop) >= 3 and loop[-1] == loop[0]:
-            loop = loop[:-1]
-        if len(loop) >= 3:
-            loops.append([vv.co.copy() for vv in loop])
-
-    bm.free()
-    return loops
-
 class MESH_OT_simple_retopo(Operator):
     """Simple retopology using contour cuts that wrap around geometry"""
     bl_idname = "mesh.simple_retopo"
@@ -251,11 +92,9 @@ class MESH_OT_simple_retopo(Operator):
             bmesh.ops.triangulate(bm, faces=bm.faces)
             bm.faces.ensure_lookup_table()
             
-            # Get axis info and create plane normal
+            # Get axis info
             axis_map = {'X': 0, 'Y': 1, 'Z': 2}
             axis_idx = axis_map[self.axis]
-            plane_no = Vector((0,0,0))
-            plane_no[axis_idx] = 1.0
             
             # Calculate bounds along chosen axis
             coords = [v.co[axis_idx] for v in bm.verts]
@@ -282,44 +121,38 @@ class MESH_OT_simple_retopo(Operator):
             new_mesh = bpy.data.meshes.new(f"{obj.data.name}_retopo")
             new_bm = bmesh.new()
             
-            # Generate contour curves for each cutting plane using robust bisect method
+            # Generate contour curves for each cutting plane
             all_loops = []
             for i, cut_pos in enumerate(cut_positions):
                 print(f"Processing cut {i+1}/{len(cut_positions)} at {cut_pos:.3f}")
                 
-                # Create plane for this cut
-                plane_co = Vector((0,0,0))
-                plane_co[axis_idx] = cut_pos
+                # Find all edge intersections with this plane
+                intersections = self.find_plane_intersections(bm, axis_idx, cut_pos)
                 
-                # Get robust slice loops using bmesh.ops.bisect_plane
-                loops = _slice_loops_from_bisect(bm, plane_co, plane_no, eps=1e-5)
-                if not loops:
-                    print(f"  No valid loops at this cut")
+                if len(intersections) < 3:
+                    print(f"  Insufficient intersections: {len(intersections)}")
                     continue
                 
-                print(f"  Found {len(loops)} loops")
+                # Create ordered contour loops from intersections
+                contour_loops = self.create_contour_loops(intersections, axis_idx, cut_pos)
                 
-                # Process each loop
-                for loop_idx, loop in enumerate(loops):
-                    # Enforce consistent winding (CCW looking along plane_no)
-                    pts2d = _project_to_plane2d(loop, plane_co, plane_no)
-                    if _signed_area_2d(pts2d) < 0.0:
-                        loop.reverse()
-                        print(f"    Flipped loop {loop_idx} for consistent winding")
-                    
-                    # Resample to fixed subdivisions
-                    loop_res = _arc_length_resample(loop, self.subdivisions)
-                    if not loop_res:
-                        print(f"    Failed to resample loop {loop_idx}")
-                        continue
-                    
-                    # Apply surface offset along plane normal
-                    loop_res = [p + plane_no * self.offset for p in loop_res]
-                    
-                    # Add vertices to new bmesh
-                    bm_verts = [new_bm.verts.new(p) for p in loop_res]
-                    all_loops.append(bm_verts)
-                    print(f"    Created loop with {len(loop_res)} vertices")
+                if not contour_loops:
+                    print(f"  No valid contour loops created")
+                    continue
+                
+                # Convert each loop to evenly subdivided vertices
+                for loop in contour_loops:
+                    if len(loop) >= 3:
+                        subdivided_loop = self.subdivide_loop(loop, self.subdivisions)
+                        if subdivided_loop:
+                            # Add vertices to bmesh with offset
+                            bm_verts = []
+                            for vert_co in subdivided_loop:
+                                # Apply surface offset
+                                offset_pos = vert_co + Vector((0, 0, self.offset)) if axis_idx == 2 else vert_co
+                                bm_verts.append(new_bm.verts.new(offset_pos))
+                            all_loops.append(bm_verts)
+                            print(f"  Created loop with {len(subdivided_loop)} vertices")
             
             print(f"Total valid loops: {len(all_loops)}")
             
@@ -332,39 +165,25 @@ class MESH_OT_simple_retopo(Operator):
             # Update vertex indices
             new_bm.verts.ensure_lookup_table()
             
-            # Create quad faces between consecutive loops with cyclic alignment
+            # Create quad faces between consecutive loops
             faces_created = 0
             for i in range(len(all_loops) - 1):
                 loop1 = all_loops[i]
                 loop2 = all_loops[i + 1]
                 
                 # Only connect if both loops have same subdivision count
-                if len(loop1) != self.subdivisions or len(loop2) != self.subdivisions:
-                    continue
-                
-                # Compute best cyclic alignment on coordinates
-                A = [v.co for v in loop1]
-                B = [v.co for v in loop2]
-                off, rev = _best_cyclic_alignment(A, B)
-                
-                # Build reindexed view of loop2
-                if rev:
-                    B_vs = [loop2[(len(loop2) - (j+off)) % len(loop2)] for j in range(len(loop2))]
-                else:
-                    B_vs = [loop2[(j+off) % len(loop2)] for j in range(len(loop2))]
-                
-                # Create quad faces
-                for j in range(self.subdivisions):
-                    v1 = loop1[j]
-                    v2 = loop1[(j + 1) % self.subdivisions]
-                    v3 = B_vs[(j + 1) % self.subdivisions]
-                    v4 = B_vs[j]
-                    
-                    try:
-                        new_bm.faces.new([v1, v2, v3, v4])
-                        faces_created += 1
-                    except ValueError:
-                        continue
+                if len(loop1) == len(loop2) == self.subdivisions:
+                    for j in range(len(loop1)):
+                        v1 = loop1[j]
+                        v2 = loop1[(j + 1) % len(loop1)]
+                        v3 = loop2[(j + 1) % len(loop2)]
+                        v4 = loop2[j]
+                        
+                        try:
+                            new_bm.faces.new([v1, v2, v3, v4])
+                            faces_created += 1
+                        except ValueError:
+                            continue
             
             print(f"Created {faces_created} quad faces")
             
@@ -395,7 +214,115 @@ class MESH_OT_simple_retopo(Operator):
             traceback.print_exc()
             return {'CANCELLED'}
     
-
+    def find_plane_intersections(self, bm, axis_idx, cut_position):
+        """Find all points where edges intersect the cutting plane"""
+        intersections = []
+        tolerance = 1e-6
+        
+        for edge in bm.edges:
+            v1, v2 = edge.verts
+            coord1 = v1.co[axis_idx]
+            coord2 = v2.co[axis_idx]
+            
+            # Check if edge crosses the cutting plane
+            if ((coord1 <= cut_position <= coord2) or (coord2 <= cut_position <= coord1)):
+                if abs(coord1 - coord2) > tolerance:
+                    # Calculate intersection point using linear interpolation
+                    t = (cut_position - coord1) / (coord2 - coord1)
+                    intersection = v1.co.lerp(v2.co, t)
+                    intersections.append(intersection)
+                elif abs(coord1 - cut_position) < tolerance:
+                    # Edge vertex is exactly on plane
+                    intersections.append(v1.co.copy())
+                elif abs(coord2 - cut_position) < tolerance:
+                    intersections.append(v2.co.copy())
+        
+        # Remove duplicate points
+        unique_intersections = []
+        for point in intersections:
+            is_duplicate = False
+            for existing in unique_intersections:
+                if (point - existing).length < tolerance * 10:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_intersections.append(point)
+        
+        return unique_intersections
+    
+    def create_contour_loops(self, intersections, axis_idx, cut_position):
+        """Organize intersection points into closed contour loops"""
+        if len(intersections) < 3:
+            return []
+        
+        # Get the two perpendicular axes
+        axes = [0, 1, 2]
+        axes.remove(axis_idx)
+        u_axis, v_axis = axes
+        
+        # Calculate center point in the perpendicular plane
+        center_u = sum(p[u_axis] for p in intersections) / len(intersections)
+        center_v = sum(p[v_axis] for p in intersections) / len(intersections)
+        
+        # Sort points by angle around the center
+        def angle_from_center(point):
+            du = point[u_axis] - center_u
+            dv = point[v_axis] - center_v
+            return math.atan2(dv, du)
+        
+        sorted_points = sorted(intersections, key=angle_from_center)
+        
+        # For now, return as single loop (could be enhanced to detect multiple loops)
+        return [sorted_points] if len(sorted_points) >= 3 else []
+    
+    def subdivide_loop(self, loop_points, target_subdivisions):
+        """Convert a contour loop to evenly spaced subdivisions"""
+        if len(loop_points) < 3:
+            return None
+        
+        # Calculate total perimeter
+        total_length = 0
+        for i in range(len(loop_points)):
+            p1 = loop_points[i]
+            p2 = loop_points[(i + 1) % len(loop_points)]
+            total_length += (p2 - p1).length
+        
+        if total_length < 1e-6:
+            return None
+        
+        # Create evenly spaced points around the loop
+        subdivided_points = []
+        target_length = total_length / target_subdivisions
+        
+        current_pos = 0.0
+        current_edge = 0
+        
+        for i in range(target_subdivisions):
+            target_pos = i * target_length
+            
+            # Find which edge this position falls on
+            edge_start_pos = 0.0
+            for edge_idx in range(len(loop_points)):
+                p1 = loop_points[edge_idx]
+                p2 = loop_points[(edge_idx + 1) % len(loop_points)]
+                edge_length = (p2 - p1).length
+                edge_end_pos = edge_start_pos + edge_length
+                
+                if target_pos <= edge_end_pos or edge_idx == len(loop_points) - 1:
+                    # Interpolate along this edge
+                    if edge_length > 1e-6:
+                        t = (target_pos - edge_start_pos) / edge_length
+                        t = max(0.0, min(1.0, t))  # Clamp to [0,1]
+                        point = p1.lerp(p2, t)
+                    else:
+                        point = p1.copy()
+                    
+                    subdivided_points.append(point)
+                    break
+                
+                edge_start_pos = edge_end_pos
+        
+        return subdivided_points if len(subdivided_points) == target_subdivisions else None
 
 class VIEW3D_PT_simple_retopo_main(Panel):
     """Main Simple Retopo Panel"""
